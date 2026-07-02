@@ -258,36 +258,29 @@ results/second_stage/{WEEK}/{CONDITION}/
 ```bash
 # Stage 1 — equal time weights
 python train_first_size4.py \
-  --week week1_jun2026 \
+  --week week4_jun2026 \
   --condition first_same_weights \
-  --window_size 4 \
+  --csv_path 2020.9-11_all_combined_T1.0_kmax10.csv \
   --alpha_w 1 --http_w 1 --multi_w 1 --unlabeled_w 1
 
 # test_weight — derive calibrated weights from first_same_weights
 python test_weight.py \
-  --results_dir results/first_stage/week1_jun2026/first_same_weights
+  --results_dir results/first_stage/week4_jun2026/first_same_weights
 # → note the suggested --alpha_w / --http_w / --multi_w / --unlabeled_w
 
 # Stage 1 — calibrated time weights  (can run in parallel with Stage 2 below)
 python train_first_size4.py \
-  --week week1_jun2026 \
+  --week week4_jun2026 \
   --condition first_diff_weights \
-  --window_size 4 \
+  --csv_path 2020.9-11_all_combined_T1.0_kmax10.csv \
   --alpha_w <A> --http_w <H> --multi_w <M> --unlabeled_w <U>
-
-# Stage 2 — MLP on first_same_weights encoders  (start as soon as first_same_weights is done)
-python train_second_size4.py \
-  --week week1_jun2026 \
-  --stage1_condition first_same_weights \
-  --condition first_same_weights_mlp_sched_none \
-  --window_size 4
 
 # Stage 2 — MLP on first_diff_weights encoders  (start after first_diff_weights is done)
 python train_second_size4.py \
-  --week week1_jun2026 \
+  --week week4_jun2026 \
   --stage1_condition first_diff_weights \
   --condition first_diff_weights_mlp_sched_none \
-  --window_size 4
+  --csv_path 2020.9-11_all_combined_T1.0_kmax10.csv 
 ```
 
 > `first_diff_weights` Stage 1 and the `first_same_weights` Stage 2 can run in parallel.
