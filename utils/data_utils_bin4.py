@@ -107,8 +107,33 @@ def prepare_targets(df, label_dict):
 
     return y_label.astype(int)
 
+def read_and_sample(path, n, label_dict, k):
+    ## 1개 CSV 읽고, 클래스마다 샘플링 (read one csv and sample up to n flows per class) / monthly split
+    df = pd.read_csv(path)
 
-def load_data(data, n_streams, label_dict, k):
+    if "c2s" in df.columns:
+        df.drop(["c2s"], axis=1, inplace=True)
+
+    df = shuffle_df(df)
+
+    attack_dict = count_num_attacks(df, n)
+    df = process_data(df, attack_dict, label_dict)
+    df = categorize_pkt_size(df, k)
+
+    print(path, dict(df["taxonomy label"].value_counts()))
+    return df.reset_index(drop=True)
+
+def load_data(data, n_streams, label_dict, k, valid_path=None, test_path=None):
+    # Monthly split: train / valid / test come from separate files
+    # train (7월-9월), valid(10월), test(11월) 각각 다른 파일에서 읽음
+    # 클래스다 min 만큼 사용 그리고 없으면(부족하면) 쓸 수 있는 최대 갯수 사용
+    # 파일 3개(train/valid/test)를 넣으면 달별 split(20000, 1000,1000), 파일 1개만 넣으면 기존처럼 무작위 split(9700, 200, 100)
+    if valid_path is not None and test_path is not None:
+        df = read_and_sample(data, n_streams, label_dict, k)
+        df_val = read_and_sample(valid_path, label_dict["num_valid"], label_dict, k)
+        df_test = read_and_sample(test_path, label_dict["num_test"], label_dict, k)
+        return df, df_val, df_test
+
     # Read Training csv file
     df = pd.read_csv(data)
 
@@ -170,10 +195,10 @@ def load_data(data, n_streams, label_dict, k):
     return df, df_val, df_test
 
 
-def define_data(df, k_packets, n_streams, label_dict):
+def define_data(df, k_packets, n_streams, label_dict, valid_path=None, test_path=None):
 
     # load data, feature scaling
-    train, valid, test = load_data(df, n_streams, label_dict, k_packets)
+    train, valid, test = load_data(df, n_streams, label_dict, k_packets, valid_path, test_path)
     # X_train, X_valid, X_test = feature_scaling(X_train, X_valid, X_test, k_packets)
     # X_train = change_outlier(X_train)
     # X_valid = change_outlier(X_valid)

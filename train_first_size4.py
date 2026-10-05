@@ -18,6 +18,11 @@ _parser.add_argument("--http_w", type=float, default=5)
 _parser.add_argument("--multi_w", type=float, default=7)
 _parser.add_argument("--unlabeled_w", type=float, default=11)
 _parser.add_argument("--csv_path", type=str, default="all_combined_T1.0_kmax10.csv")
+_parser.add_argument("--valid_csv_path", type=str, default=None)  # 달별 split: valid 파일 (10월)
+_parser.add_argument("--test_csv_path", type=str, default=None)   # 달별 split: test 파일 (11월)
+_parser.add_argument("--n_streams", type=int, default=10000)      # train 클래스당 최대 개수
+_parser.add_argument("--num_valid", type=int, default=None)       # None이면 config_label.yaml 값 사용
+_parser.add_argument("--num_test", type=int, default=None)        # None이면 config_label.yaml 값 사용
 _parser.add_argument("--max_len", type=int, default=9)
 _args, _ = _parser.parse_known_args()
 
@@ -40,14 +45,23 @@ Multi_time_weight = _args.multi_w
 Unlabeled_time_weight = _args.unlabeled_w
 
 csv_path = _args.csv_path
-n_streams = 10000
+n_streams = _args.n_streams # n_streams 값 사용(안 넣으면 10000) , 부족 한 클래스는 있는 만큼 최대한 사용
 
 label_dict = yaml.safe_load(open("config_label.yaml", "r"))
+# 인자를 안 넣어주면 (200/100 기존 사용)
+# --num_valid 1000 --num_test 1000 넣으면 바뀜
+# stage 1은 valid와 test를 쓰지 않지만, stage 2와 같은 명령어 형태로 맞춤
+if _args.num_valid is not None:
+    label_dict["num_valid"] = _args.num_valid
+if _args.num_test is not None:
+    label_dict["num_test"] = _args.num_test
+
 
 valid_pkt_time_columns = [f"pktTime{i}" for i in range(max_len)]
 valid_pkt_size_columns = [f"pktSize{i}" for i in range(max_len)]
 
-train, _, _ = data_utils.define_data(csv_path, max_len, n_streams, label_dict)
+#터미널에서 받은 10, 11월을  data_utils_bin4.py 로 전달(달별로 하는 방식을 위해)
+train, _, _ = data_utils.define_data(csv_path, max_len, n_streams, label_dict, _args.valid_csv_path, _args.test_csv_path)
 
 
 def split_by_label(df):
