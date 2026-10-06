@@ -18,6 +18,11 @@ _parser.add_argument("--stage1_condition", type=str, default="time_w_balanced")
 _parser.add_argument("--condition", type=str, default="w9_ws4_mlp_A_sched_none")
 _parser.add_argument("--window_size", type=int, default=4)
 _parser.add_argument("--csv_path", type=str, default="all_combined_T1.0_kmax10.csv")
+_parser.add_argument("--valid_csv_path", type=str, default=None)  # 달별 split: valid 파일 (10월)
+_parser.add_argument("--test_csv_path", type=str, default=None)   # 달별 split: test 파일 (11월)
+_parser.add_argument("--n_streams", type=int, default=10000)      # train 클래스당 최대 개수
+_parser.add_argument("--num_valid", type=int, default=None)       # None이면 config_label.yaml 값 사용
+_parser.add_argument("--num_test", type=int, default=None)        # None이면 config_label.yaml 값 사용
 _parser.add_argument("--max_len", type=int, default=9)
 _parser.add_argument("--scheduler", type=str, default="none",
                      choices=["none", "reduce", "cosine", "cosine_wr", "multistep", "exponential", "onecycle"])
@@ -47,14 +52,20 @@ window_size = _args.window_size
 batch_size, num_workers = (max_len - window_size) * 10, 0  # batch 조정
 
 csv_path = _args.csv_path
-n_streams = 10000
+n_streams = _args.n_streams  # --n_streams 값 사용(안 넣으면 10000), 부족한 클래스는 있는 만큼 최대한 사용
 
 label_dict = yaml.safe_load(open("config_label.yaml", "r"))
+# --num_valid 1000 --num_test 1000을 넣으면 valid/test 개수를 바꿈 (안 넣으면  기존 값 200/100 사용)
+if _args.num_valid is not None:
+    label_dict["num_valid"] = _args.num_valid
+if _args.num_test is not None:
+    label_dict["num_test"] = _args.num_test
 
 valid_pkt_time_columns = [f"pktTime{i}" for i in range(max_len)]
 valid_pkt_size_columns = [f"pktSize{i}" for i in range(max_len)]
 
-train, valid, test = data_utils.define_data(csv_path, max_len, n_streams, label_dict)
+# 터미널에서 받은 10월, 11월 파일 경로를 data_utils_bin4.py로 전달 (달별 split을 위해)
+train, valid, test = data_utils.define_data(csv_path, max_len, n_streams, label_dict, _args.valid_csv_path, _args.test_csv_path)
 
 #### train, valid, test가 동일한지 확인해보기
 
