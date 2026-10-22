@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.init as init
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_auc_score
 import pandas as pd
 from collections import defaultdict
 
@@ -142,6 +142,7 @@ def save_classification_report(
     train_report_dict,
     valid_report_dict,
     test_report_dict,
+    auc_dicts=None,
 ):
     i = 0
     dic = defaultdict(lambda: defaultdict(dict))
@@ -200,5 +201,29 @@ def save_classification_report(
     dic[i]["Test_Class3_recall"] = test_report_dict["class 3"]["recall"]
     dic[i]["Test_Acc"] = test_report_dict["accuracy"]
 
+    # AUC (one-vs-rest): auc_dicts가 있을 때만 컬럼 추가, 없으면 기존과 동일
+    if auc_dicts is not None:
+        for split in ["Train", "Valid", "Test"]:
+            auc = auc_dicts[split]
+            dic[i][f"{split}_Macro_AUC"] = auc["macro"]
+            for c in range(4):
+                dic[i][f"{split}_Class{c}_AUC"] = auc.get(c)
+
     df = pd.DataFrame.from_dict(dic, orient="index")
     df.to_csv(f"./{result_path}/classification_report.csv", index=False)
+
+
+def compute_auc(y_true, y_prob):
+    """클래스별 AUC(one-vs-rest)와 macro AUC 계산. 해당 클래스가 없으면 None"""
+    y_true = np.asarray(y_true)
+    n_classes = y_prob.shape[1]
+    auc = {}
+    for c in range(n_classes):
+        y_bin = (y_true == c).astype(int)
+        if y_bin.min() == y_bin.max():
+            auc[c] = None
+        else:
+            auc[c] = roc_auc_score(y_bin, y_prob[:, c])
+    valid = [v for v in auc.values() if v is not None]
+    auc["macro"] = float(np.mean(valid)) if valid else None
+    return auc
