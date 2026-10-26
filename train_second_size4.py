@@ -422,10 +422,11 @@ def evaluate_model(
     return loss, accuracy, f1
 
 
-def predict_model(mlp, data_loader, Alpha_model, HTTP_model, Multi_model, Normal_model):
+def predict_model(mlp, data_loader, Alpha_model, HTTP_model, Multi_model, Normal_model, return_proba=False):
     mlp.eval()
 
     all_preds, all_labels = [], []
+    all_probs = []  # AUC용 클래스별 확률
 
     # first_print = True
 
@@ -454,6 +455,7 @@ def predict_model(mlp, data_loader, Alpha_model, HTTP_model, Multi_model, Normal
 
             # probs = F.softmax(predictions, dim=1)
             _, predicted_classes = torch.max(predictions, 1)
+            all_probs.append(torch.softmax(predictions, dim=1).cpu().numpy())  # AUC용
 
             all_preds.extend(predicted_classes.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -464,6 +466,8 @@ def predict_model(mlp, data_loader, Alpha_model, HTTP_model, Multi_model, Normal
         # y_pred_list = list(itertools.chain(*y_pred_list))
         # y_list = list(itertools.chain(*y_list))
 
+    if return_proba:
+        return all_labels, all_preds, np.concatenate(all_probs)
     return all_labels, all_preds
 
 
@@ -632,29 +636,32 @@ def train_and_evaluate_model(epochs, train_loader, valid_loader, test_loader):
 
     mlp.load_state_dict(torch.load(f"{OUT_DIR}/best_mlp.pt", weights_only=True))
 
-    y_train_list, y_train_pred_list = predict_model(
+    y_train_list, y_train_pred_list, y_train_prob = predict_model(
         mlp,
         train_loader,
         Alpha_model,
         HTTP_model,
         Multi_model,
         Normal_model,
+        return_proba=True,  # AUC 계산용 확률도 받음
     )
-    y_valid_list, y_valid_pred_list = predict_model(
+    y_valid_list, y_valid_pred_list, y_valid_prob = predict_model(
         mlp,
         valid_loader,
         Alpha_model,
         HTTP_model,
         Multi_model,
         Normal_model,
+        return_proba=True,  # AUC 계산용 확률도 받음
     )
-    y_test_list, y_test_pred_list = predict_model(
+    y_test_list, y_test_pred_list, y_test_prob = predict_model(
         mlp,
         test_loader,
         Alpha_model,
         HTTP_model,
         Multi_model,
         Normal_model,
+        return_proba=True,  # AUC 계산용 확률도 받음
     )
 
     utils.plot_cm(
@@ -708,12 +715,22 @@ def train_and_evaluate_model(epochs, train_loader, valid_loader, test_loader):
         "best_valid_loss": valid_loss_,
         "best_epoch": best_epoch,
     }
+    # AUC (one-vs-rest, 클래스별 + macro)
+    auc_dicts = {
+        "Train": utils.compute_auc(y_train_list, y_train_prob),
+        "Valid": utils.compute_auc(y_valid_list, y_valid_prob),
+        "Test": utils.compute_auc(y_test_list, y_test_prob),
+    }
+    print("AUC (macro) - Train: {}, Valid: {}, Test: {}".format(
+        auc_dicts["Train"]["macro"], auc_dicts["Valid"]["macro"], auc_dicts["Test"]["macro"]))
+
     utils.save_classification_report(
         OUT_DIR,
         best_result,
         train_report_dict,
         valid_report_dict,
         test_report_dict,
+        auc_dicts,
     )
 
 
