@@ -24,6 +24,7 @@ _parser.add_argument("--num_valid", type=int, default=None)       # None이면 c
 _parser.add_argument("--num_test", type=int, default=None)        # None이면 config_label.yaml 값 사용
 _parser.add_argument("--max_len", type=int, default=9)
 _parser.add_argument("--epochs", type=int, default=1000)
+_parser.add_argument("--seed", type=int, default=0)
 _args, _ = _parser.parse_known_args()
 
 WEEK = _args.week
@@ -480,7 +481,7 @@ def model_train(
 
 if __name__ == "__main__":
 
-    utils.seed_everything(0)
+    utils.seed_everything(_args.seed)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     (

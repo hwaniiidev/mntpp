@@ -136,6 +136,7 @@ To switch schedulers, uncomment the corresponding block in `train_second_size4.p
 | `--multi_w` | `7` | Multi time_weight |
 | `--unlabeled_w` | `11` | Unlabeled time_weight |
 | `--epochs` | `1000` | Max epochs (early stopping may end sooner) |
+| `--seed` | `0` | Random seed |
 
 ### Run Command
 
@@ -216,6 +217,7 @@ Suggested --alpha_w/http_w/multi_w/unlabeled_w for first_diff_weights:
 | `--condition` | `w9_ws4_mlp_A_sched_none` | Stage 2 experiment condition name |
 | `--window_size` | `4` | Sliding window size (must match Stage 1) |
 | `--epochs` | `1000` | Max epochs (early stopping may end sooner) |
+| `--seed` | `0` | Random seed |
 
 Stage 1 encoder path resolved as:
 ```
