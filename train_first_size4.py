@@ -151,8 +151,8 @@ encode_Unlabeled_train = encode(Unlabeled_train_cat)
 
 
 class train_data:
-    # 학습 데이터 전체를 device(GPU)에 올려두고 batch는 index로 바로 꺼냄
-    # (기존 DataLoader + pandas iloc 방식과 x, y 값은 동일)
+    # Keep all training data on the device (GPU) and gather each batch by index
+    # (yields the same x, y values as the previous DataLoader + pandas iloc version)
     def __init__(self, train, encode_train):
         self.valid_slice_idxn = torch.from_numpy(
             np.where(train["valid_slice_flag"])[0]
@@ -194,9 +194,9 @@ Multi_train_dataset = train_data(Multi_train_cat, encode_Multi_train)
 Unlabeled_train_dataset = train_data(Unlabeled_train_cat, encode_Unlabeled_train)
 
 class TrainStep:
-    # batch 1개 학습(forward + backward + Adam)을 CUDA Graph로 캡처해두고 replay
-    # 작은 모델 + batch 10에서는 GPU 연산보다 kernel launch/파이썬 오버헤드가 대부분이라 이를 제거
-    # CPU에서는 그래프 없이 그대로 실행
+    # Capture one training step (forward + backward + Adam) as a CUDA Graph and replay it
+    # With a tiny model and batch size 10, kernel launch / Python overhead dominates GPU compute
+    # On CPU, the step runs eagerly without a graph
     def __init__(self, dataset, encoder, forecaster, optimizer, time_weight):
         self.dataset = dataset
         self.encoder = encoder
@@ -205,7 +205,7 @@ class TrainStep:
         self.time_weight = time_weight
 
         self.batch_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
-        self.loss_sum = torch.zeros(3, device=device)  # Loss, RMSE_time, CEL_size 합
+        self.loss_sum = torch.zeros(3, device=device)  # sum of Loss, RMSE_time, CEL_size
         self.graph = None
 
         encoder.train()
@@ -229,8 +229,8 @@ class TrainStep:
         self.loss_sum += self.last_loss
 
     def capture(self):
-        # 캡처 전 warmup step으로 바뀐 weight / Adam state는 캡처 후 초기 상태로 되돌림
-        # → 실제 학습은 초기화된 모델에서 시작 (학습 결과에 영향 없음)
+        # Restore weights / Adam state changed by the warmup steps after capture,
+        # so actual training starts from the freshly initialized model
         params = [p for group in self.optimizer.param_groups for p in group["params"]]
         init_params = [p.detach().clone() for p in params]
 
@@ -278,7 +278,7 @@ def model_epoch(train_step):
             print(
                 f"loss: {loss:>7f}, ln(1+loss): {np.log(1+loss):>7f} | CEloss_action: {CEL_size:>7f}, MSEloss: {RMSE_time} | batch: {batch} | sample: [{current:>5d}/{size:>5d}] | lr: {train_step.optimizer.param_groups[0]['lr']}"
             )
-    # batch 평균 (기존 rolling mean과 동일한 값)
+    # mean over batches (same value as the previous rolling mean)
     (
         loss_rollingmean,
         lossRMSE_rollingmean,
@@ -322,7 +322,7 @@ def model_train(
         list(encoder.parameters()) + list(forecaster.parameters()),
         lr=0.001,
         eps=1e-16,
-        capturable=str(device).startswith("cuda"),  # CUDA Graph 캡처용
+        capturable=str(device).startswith("cuda"),  # required for CUDA Graph capture
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

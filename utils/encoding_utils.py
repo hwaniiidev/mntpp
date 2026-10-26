@@ -6,8 +6,8 @@ _positional_encoding_cache = {}
 
 
 def positional_encoding(src):
-    # 값이 src의 shape/dtype/device에만 의존하므로 한 번 계산 후 재사용
-    # (원소 단위 GPU 대입을 매 forward마다 반복하지 않도록)
+    # The output depends only on src's shape/dtype/device, so compute once and reuse
+    # (avoids per-element GPU writes on every forward pass)
     key = (tuple(src.shape), src.dtype, src.device)
     if key not in _positional_encoding_cache:
         _positional_encoding_cache[key] = _compute_positional_encoding(src)
