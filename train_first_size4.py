@@ -194,9 +194,7 @@ Multi_train_dataset = train_data(Multi_train_cat, encode_Multi_train)
 Unlabeled_train_dataset = train_data(Unlabeled_train_cat, encode_Unlabeled_train)
 
 class TrainStep:
-    # Capture one training step (forward + backward + Adam) as a CUDA Graph and replay it
-    # With a tiny model and batch size 10, kernel launch / Python overhead dominates GPU compute
-    # On CPU, the step runs eagerly without a graph
+    # One training step (forward + backward + Adam) of one class's model
     def __init__(self, dataset, encoder, forecaster, optimizer, time_weight):
         self.dataset = dataset
         self.encoder = encoder
@@ -204,14 +202,15 @@ class TrainStep:
         self.optimizer = optimizer
         self.time_weight = time_weight
 
+        # Persistent buffers, so CUDA Graphs can read / write them across replays
         self.batch_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
         self.loss_sum = torch.zeros(3, device=device)  # sum of Loss, RMSE_time, CEL_size
-        self.graph = None
+        self.last_loss = torch.zeros(3, device=device)
 
         encoder.train()
         forecaster.train()
         if str(device).startswith("cuda"):
-            self.capture()
+            self.warmup()
 
     def step(self):
         X, Y = self.dataset.get_batch(self.batch_idx)
@@ -225,11 +224,13 @@ class TrainStep:
         Loss.backward()
         self.optimizer.step()
 
-        self.last_loss = torch.stack((Loss, RMSE_time, CEL_size)).detach()
-        self.loss_sum += self.last_loss
+        losses = torch.stack((Loss, RMSE_time, CEL_size)).detach()
+        self.last_loss.copy_(losses)
+        self.loss_sum += losses
 
-    def capture(self):
-        # Restore weights / Adam state changed by the warmup steps after capture,
+    def warmup(self):
+        # A few eager steps allocate grads / Adam state before CUDA Graph capture.
+        # Weights and Adam state are restored afterwards,
         # so actual training starts from the freshly initialized model
         params = [p for group in self.optimizer.param_groups for p in group["params"]]
         init_params = [p.detach().clone() for p in params]
@@ -241,10 +242,6 @@ class TrainStep:
                 self.step()
         torch.cuda.current_stream().wait_stream(stream)
 
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.step()
-
         with torch.no_grad():
             for p, p0 in zip(params, init_params):
                 p.copy_(p0)
@@ -253,153 +250,236 @@ class TrainStep:
                 for v in state.values():
                     v.zero_()
             self.loss_sum.zero_()
-
-    def run(self, batch_idx):
-        self.batch_idx.copy_(batch_idx)
-        if self.graph is None:
-            self.step()
-        else:
-            self.graph.replay()
+            self.last_loss.zero_()
 
 
-def model_epoch(train_step):
-    size = len(train_step.dataset)
-    batch_total = size // batch_size  # drop_last=True
-    perm = torch.randperm(size, device=device)  # shuffle=True
-    train_step.loss_sum.zero_()
+class ParallelTrainStep:
+    # Runs one training step of every active class's model at once.
+    # On CUDA, the steps are captured into a single CUDA Graph with each model on its own stream,
+    # so the GPU runs the 4 small models concurrently and kernel launch overhead is paid once.
+    # A graph is captured per set of active models (e.g. after a class early-stops).
+    # Capturing records kernels without running them, so it does not change any weights.
+    # On CPU, the steps run eagerly one after another.
+    def __init__(self, train_steps):
+        self.train_steps = train_steps
+        self.graphs = {}
+        self.use_graph = str(device).startswith("cuda")
+        if self.use_graph:
+            self.streams = [torch.cuda.Stream() for _ in train_steps]
 
-    for batch in range(batch_total):
-        train_step.run(perm[batch * batch_size : (batch + 1) * batch_size])
+    def capture(self, active):
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            for i in active:
+                self.streams[i].wait_stream(capture_stream)
+                with torch.cuda.stream(self.streams[i]):
+                    self.train_steps[i].step()
+            for i in active:
+                capture_stream.wait_stream(self.streams[i])
+        return graph
+
+    def run(self, batch_idx_by_model):
+        active = tuple(sorted(batch_idx_by_model))
+        for i in active:
+            self.train_steps[i].batch_idx.copy_(batch_idx_by_model[i])
+
+        if not self.use_graph:
+            for i in active:
+                self.train_steps[i].step()
+            return
+
+        if active not in self.graphs:
+            self.graphs[active] = self.capture(active)
+        self.graphs[active].replay()
+
+
+def model_epoch(parallel_step, active, labels):
+    train_steps = parallel_step.train_steps
+    sizes = {i: len(train_steps[i].dataset) for i in active}
+    batch_totals = {i: sizes[i] // batch_size for i in active}  # drop_last=True
+    perms = {i: torch.randperm(sizes[i], device=device) for i in active}  # shuffle=True
+    for i in active:
+        train_steps[i].loss_sum.zero_()
+
+    for batch in range(max(batch_totals.values())):
+        # A class with fewer batches simply drops out once its epoch is done
+        parallel_step.run(
+            {
+                i: perms[i][batch * batch_size : (batch + 1) * batch_size]
+                for i in active
+                if batch < batch_totals[i]
+            }
+        )
 
         if batch % 500 == 0:
-            print("batch", batch, "/", batch_total)
-            loss, RMSE_time, CEL_size = train_step.last_loss.tolist()
-            current = batch * batch_size
-            print(
-                f"loss: {loss:>7f}, ln(1+loss): {np.log(1+loss):>7f} | CEloss_action: {CEL_size:>7f}, MSEloss: {RMSE_time} | batch: {batch} | sample: [{current:>5d}/{size:>5d}] | lr: {train_step.optimizer.param_groups[0]['lr']}"
-            )
-    # mean over batches (same value as the previous rolling mean)
-    (
-        loss_rollingmean,
-        lossRMSE_rollingmean,
-        lossCEL_rollingmean,
-    ) = (train_step.loss_sum / batch_total).tolist()
+            for i in active:
+                if batch >= batch_totals[i]:
+                    continue
+                loss, RMSE_time, CEL_size = train_steps[i].last_loss.tolist()
+                current = batch * batch_size
+                print(
+                    f"[{labels[i]}] batch {batch} / {batch_totals[i]} | loss: {loss:>7f}, ln(1+loss): {np.log(1+loss):>7f} | CEloss_action: {CEL_size:>7f}, MSEloss: {RMSE_time} | sample: [{current:>5d}/{sizes[i]:>5d}] | lr: {train_steps[i].optimizer.param_groups[0]['lr']}"
+                )
 
-    print("epoch ended")
-    print(
-        f"Epoch loss:    mean: {loss_rollingmean:>7f}, ln(1+loss) mean: {np.log(1+loss_rollingmean):>7f}"
-    )
-    print(
-        f"Epoch MSEloss: mean: {lossRMSE_rollingmean:>7f}, ln(1+loss) mean: {np.log(1+lossRMSE_rollingmean):>7f}"
-    )
-    print(
-        f"Epoch CEloss_action:  mean: {lossCEL_rollingmean:>7f}, ln(1+loss) mean: {np.log(1+lossCEL_rollingmean):>7f}"
-    )
-    return (
-        loss_rollingmean,
-        lossRMSE_rollingmean,
-        lossCEL_rollingmean,
-    )
+    epoch_losses = {}
+    for i in active:
+        # mean over batches (same value as the previous rolling mean)
+        (
+            loss_rollingmean,
+            lossRMSE_rollingmean,
+            lossCEL_rollingmean,
+        ) = (train_steps[i].loss_sum / batch_totals[i]).tolist()
+
+        print(f"[{labels[i]}] epoch ended")
+        print(
+            f"[{labels[i]}] Epoch loss:    mean: {loss_rollingmean:>7f}, ln(1+loss) mean: {np.log(1+loss_rollingmean):>7f}"
+        )
+        print(
+            f"[{labels[i]}] Epoch MSEloss: mean: {lossRMSE_rollingmean:>7f}, ln(1+loss) mean: {np.log(1+lossRMSE_rollingmean):>7f}"
+        )
+        print(
+            f"[{labels[i]}] Epoch CEloss_action:  mean: {lossCEL_rollingmean:>7f}, ln(1+loss) mean: {np.log(1+lossCEL_rollingmean):>7f}"
+        )
+        epoch_losses[i] = (
+            loss_rollingmean,
+            lossRMSE_rollingmean,
+            lossCEL_rollingmean,
+        )
+    return epoch_losses
 
 
 def model_train(
     epochs,
-    train_dataset,
-    time_weight,
+    train_datasets,
+    time_weights,
+    labels,
 ):
+    # Trains the per-class models together; each class keeps its own data, shuffling,
+    # loss history, early stopping and saved state, exactly as when trained alone
     torch.cuda.empty_cache()
     import gc
 
     gc.collect()
 
-    encoder = EncoderNTPP().to(device)
-    forecaster = ForecasterNTPP().to(device)
-
-    # encoder.apply(utils.init_weights)
-    # forecaster.apply(utils.init_weights)
-
-    optimizer = optim.Adam(
-        list(encoder.parameters()) + list(forecaster.parameters()),
-        lr=0.001,
-        eps=1e-16,
-        capturable=str(device).startswith("cuda"),  # required for CUDA Graph capture
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, factor=0.1, patience=3
-    )
-
-    train_loss_hist = pd.DataFrame(
-        columns=[
-            "epoch",
-            "trn_L",
-            "trn_MSEL",
-            "trn_size",
-        ]
-    )
-    time_start = datetime.now()
-
     early_stop_patience = 150
-    patience_counter = 0
-    best_train_loss = float("inf")
-    best_encoding_state_dict = None
-    epoch_train_loss = []
-    epoch_train_acc = []
+    time_start = datetime.now()
+    models = []
+    train_steps = []
 
-    train_step = TrainStep(train_dataset, encoder, forecaster, optimizer, time_weight)
+    for train_dataset, time_weight in zip(train_datasets, time_weights):
+        encoder = EncoderNTPP().to(device)
+        forecaster = ForecasterNTPP().to(device)
+
+        # encoder.apply(utils.init_weights)
+        # forecaster.apply(utils.init_weights)
+
+        optimizer = optim.Adam(
+            list(encoder.parameters()) + list(forecaster.parameters()),
+            lr=0.001,
+            eps=1e-16,
+            capturable=str(device).startswith("cuda"),  # required for CUDA Graph capture
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.1, patience=3
+        )
+
+        models.append(
+            {
+                "encoder": encoder,
+                "forecaster": forecaster,
+                "optimizer": optimizer,
+                "train_loss_hist": pd.DataFrame(
+                    columns=[
+                        "epoch",
+                        "trn_L",
+                        "trn_MSEL",
+                        "trn_size",
+                    ]
+                ),
+                "patience_counter": 0,
+                "best_train_loss": float("inf"),
+                "best_encoding_state_dict": None,
+                "time_end": None,
+            }
+        )
+        train_steps.append(
+            TrainStep(train_dataset, encoder, forecaster, optimizer, time_weight)
+        )
+
+    parallel_step = ParallelTrainStep(train_steps)
+    active = list(range(len(models)))
 
     for epoch in range(epochs):
+        if not active:
+            break
         torch.cuda.empty_cache()
         import gc
 
         gc.collect()
-        print(f"Epoch {epoch}\n-------------------------------")
+        print(f"Epoch {epoch} ({', '.join(labels[i] for i in active)})\n-------------------------------")
         epoch_start = datetime.now()
-        train_loss = model_epoch(train_step)
+        epoch_losses = model_epoch(parallel_step, active, labels)
         print(f"Epoch time: {(datetime.now() - epoch_start).total_seconds():.1f}s")
 
-        epochloss = pd.DataFrame(
-            np.concatenate((np.array([epoch]), np.asarray(train_loss)))
-        ).T
-        # print("-----epochloss------")
-        # print(epochloss)
-        epochloss.columns = train_loss_hist.columns
-        train_loss_hist = pd.concat([train_loss_hist, epochloss], ignore_index=True)
+        for i in list(active):
+            m = models[i]
+            train_loss = epoch_losses[i]
 
-        # scheduler.step(valid_loss_value)
-        # scheduler.step()
+            epochloss = pd.DataFrame(
+                np.concatenate((np.array([epoch]), np.asarray(train_loss)))
+            ).T
+            epochloss.columns = m["train_loss_hist"].columns
+            m["train_loss_hist"] = pd.concat(
+                [m["train_loss_hist"], epochloss], ignore_index=True
+            )
 
-        print("train_loss : ", train_loss[0])
-        print("best_train_loss : ", best_train_loss)
-        if train_loss[0] < best_train_loss:
-            best_train_loss = train_loss[0]
-            best_epoch = epoch + 1
-            best_encoding_state_dict = encoder.state_dict()  # 현재 상태 저장
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            print(f"No improvement: {patience_counter}/{early_stop_patience}")
-            if patience_counter >= early_stop_patience:
-                print(f"Early stopping at epoch {epoch + 1}")
-                break
+            # scheduler.step(valid_loss_value)
+            # scheduler.step()
 
-        if optimizer.param_groups[0]["lr"] < 1e-7:
-            break
+            print(f"[{labels[i]}] train_loss : ", train_loss[0])
+            print(f"[{labels[i]}] best_train_loss : ", m["best_train_loss"])
+            stop = False
+            if train_loss[0] < m["best_train_loss"]:
+                m["best_train_loss"] = train_loss[0]
+                m["best_encoding_state_dict"] = m["encoder"].state_dict()  # 현재 상태 저장
+                m["patience_counter"] = 0
+            else:
+                m["patience_counter"] += 1
+                print(
+                    f"[{labels[i]}] No improvement: {m['patience_counter']}/{early_stop_patience}"
+                )
+                if m["patience_counter"] >= early_stop_patience:
+                    print(f"[{labels[i]}] Early stopping at epoch {epoch + 1}")
+                    stop = True
 
-    time_end = datetime.now()
-    trainable_params_num = sum(
-        p.numel() for p in encoder.parameters() if p.requires_grad
-    ) + sum(p.numel() for p in forecaster.parameters() if p.requires_grad)
-    train_time = time_end - time_start
-    train_time = train_time.total_seconds()
+            if m["optimizer"].param_groups[0]["lr"] < 1e-7:
+                stop = True
 
-    return (
-        train_loss_hist,
-        train_time,
-        trainable_params_num,
-        best_encoding_state_dict,
-        encoder,
-    )
+            if stop:
+                m["time_end"] = datetime.now()
+                active.remove(i)
+
+    results = []
+    for m in models:
+        time_end = m["time_end"] or datetime.now()
+        trainable_params_num = sum(
+            p.numel() for p in m["encoder"].parameters() if p.requires_grad
+        ) + sum(p.numel() for p in m["forecaster"].parameters() if p.requires_grad)
+        # Wall-clock time from the start of the joint training until this class stopped
+        train_time = (time_end - time_start).total_seconds()
+
+        results.append(
+            (
+                m["train_loss_hist"],
+                train_time,
+                trainable_params_num,
+                m["best_encoding_state_dict"],
+                m["encoder"],
+            )
+        )
+    return results
 
 
 if __name__ == "__main__":
@@ -408,47 +488,39 @@ if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     (
-        Alpha_train_loss,
-        Alpha_train_time,
-        Alpha_trainable_params_num,
-        Alpha_model_parameter,
-        Alpha_encoder,
+        (
+            Alpha_train_loss,
+            Alpha_train_time,
+            Alpha_trainable_params_num,
+            Alpha_model_parameter,
+            Alpha_encoder,
+        ),
+        (
+            HTTP_train_loss,
+            HTTP_train_time,
+            HTTP_trainable_params_num,
+            HTTP_model_parameter,
+            HTTP_encoder,
+        ),
+        (
+            Multi_train_loss,
+            Multi_train_time,
+            Multi_trainable_params_num,
+            Multi_model_parameter,
+            Multi_encoder,
+        ),
+        (
+            Unlabeled_train_loss,
+            Unlabeled_train_time,
+            Unlabeled_trainable_params_num,
+            Unlabeled_model_parameter,
+            Unlabeled_encoder,
+        ),
     ) = model_train(
         epochs,
-        Alpha_train_dataset,
-        Alpha_time_weight,
-    )
-
-    (
-        HTTP_train_loss,
-        HTTP_train_time,
-        HTTP_trainable_params_num,
-        HTTP_model_parameter,
-        HTTP_encoder,
-    ) = model_train(epochs, HTTP_train_dataset, HTTP_time_weight)
-
-    (
-        Multi_train_loss,
-        Multi_train_time,
-        Multi_trainable_params_num,
-        Multi_model_parameter,
-        Multi_encoder,
-    ) = model_train(
-        epochs,
-        Multi_train_dataset,
-        Multi_time_weight,
-    )
-
-    (
-        Unlabeled_train_loss,
-        Unlabeled_train_time,
-        Unlabeled_trainable_params_num,
-        Unlabeled_model_parameter,
-        Unlabeled_encoder,
-    ) = model_train(
-        epochs,
-        Unlabeled_train_dataset,
-        Unlabeled_time_weight,
+        [Alpha_train_dataset, HTTP_train_dataset, Multi_train_dataset, Unlabeled_train_dataset],
+        [Alpha_time_weight, HTTP_time_weight, Multi_time_weight, Unlabeled_time_weight],
+        ["Alpha", "HTTP", "Multi", "Unlabeled"],
     )
 
     out_dir = f"./results/first_stage/{WEEK}/{CONDITION}"
