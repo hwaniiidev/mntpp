@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 import os
 import yaml
 from datetime import datetime
@@ -24,6 +23,7 @@ _parser.add_argument("--n_streams", type=int, default=10000)      # train 클래
 _parser.add_argument("--num_valid", type=int, default=None)       # None이면 config_label.yaml 값 사용
 _parser.add_argument("--num_test", type=int, default=None)        # None이면 config_label.yaml 값 사용
 _parser.add_argument("--max_len", type=int, default=9)
+_parser.add_argument("--epochs", type=int, default=1000)
 _args, _ = _parser.parse_known_args()
 
 WEEK = _args.week
@@ -35,7 +35,7 @@ from config_size4 import *
 from models.NTPP_size4 import EncoderNTPP, ForecasterNTPP
 
 max_len = _args.max_len
-epochs = 1000
+epochs = _args.epochs
 batch_size, num_workers = 10, 0
 window_size = _args.window_size
 
@@ -151,22 +151,22 @@ encode_Unlabeled_train = encode(Unlabeled_train_cat)
 
 
 class train_data:
+    # 학습 데이터 전체를 device(GPU)에 올려두고 batch는 index로 바로 꺼냄
+    # (기존 DataLoader + pandas iloc 방식과 x, y 값은 동일)
     def __init__(self, train, encode_train):
-        self.idx = np.repeat(True, len(train))
-        self.valid_slice_idxn = np.where(
-            np.logical_and(self.idx, train["valid_slice_flag"])
-        )[0]
-        self.train = train
-        self.encode_train = encode_train
+        self.valid_slice_idxn = torch.from_numpy(
+            np.where(train["valid_slice_flag"])[0]
+        ).to(device)
+        self.encode_train = encode_train.to(device)
+        self.window_offset = torch.arange(window_size, device=device)
 
     def __len__(self):
-        return int(np.sum(self.train.loc[self.idx, "valid_slice_flag"]))
+        return len(self.valid_slice_idxn)
 
-    def __getitem__(self, i):
-        j = self.valid_slice_idxn[i]
-        x = self.encode_train[j : j + window_size]
-        y = self.train.iloc[j + window_size].loc[target_vars]
-        y = torch.from_numpy(y.to_numpy(dtype="float64"))
+    def get_batch(self, batch_idx):
+        j = self.valid_slice_idxn[batch_idx]
+        x = self.encode_train[j[:, None] + self.window_offset]
+        y = self.encode_train[j + window_size]  # = target_vars (pktTime, pktSize)
 
         return x, y
 
@@ -193,100 +193,97 @@ HTTP_train_dataset = train_data(HTTP_train_cat, encode_HTTP_train)
 Multi_train_dataset = train_data(Multi_train_cat, encode_Multi_train)
 Unlabeled_train_dataset = train_data(Unlabeled_train_cat, encode_Unlabeled_train)
 
-Alpha_train_loader = DataLoader(
-    Alpha_train_dataset,
-    shuffle=True,
-    batch_size=batch_size,
-    num_workers=num_workers,
-    drop_last=True,
-)
+class TrainStep:
+    # batch 1개 학습(forward + backward + Adam)을 CUDA Graph로 캡처해두고 replay
+    # 작은 모델 + batch 10에서는 GPU 연산보다 kernel launch/파이썬 오버헤드가 대부분이라 이를 제거
+    # CPU에서는 그래프 없이 그대로 실행
+    def __init__(self, dataset, encoder, forecaster, optimizer, time_weight):
+        self.dataset = dataset
+        self.encoder = encoder
+        self.forecaster = forecaster
+        self.optimizer = optimizer
+        self.time_weight = time_weight
 
+        self.batch_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+        self.loss_sum = torch.zeros(3, device=device)  # Loss, RMSE_time, CEL_size 합
+        self.graph = None
 
-HTTP_train_loader = DataLoader(
-    HTTP_train_dataset,
-    shuffle=True,
-    batch_size=batch_size,
-    num_workers=num_workers,
-    drop_last=True,
-)
-
-
-Multi_train_loader = DataLoader(
-    Multi_train_dataset,
-    shuffle=True,
-    batch_size=batch_size,
-    num_workers=num_workers,
-    drop_last=True,
-)
-
-
-Unlabeled_train_loader = DataLoader(
-    Unlabeled_train_dataset,
-    shuffle=True,
-    batch_size=batch_size,
-    num_workers=num_workers,
-    drop_last=True,
-)
-
-
-def model_epoch(
-    dataloader,
-    train_dataloader,
-    encoder,
-    forecaster,
-    optimizer,
-    scheduler,
-    epochtype,
-    time_weight,
-):
-    if epochtype == "train":
         encoder.train()
         forecaster.train()
-    else:
-        encoder.eval()
-        forecaster.eval()
+        if str(device).startswith("cuda"):
+            self.capture()
 
-    size = len(dataloader.dataset)
-    loss_rollingmean, lossRMSE_rollingmean, lossCEL_rollingmean = 0.0, 0.0, 0.0
+    def step(self):
+        X, Y = self.dataset.get_batch(self.batch_idx)
 
-    for batch, (X, Y) in enumerate(dataloader):
-        batch_total = len(train_dataloader)
-        # print("batch",batch+1,"/", batch_total)
-        X, Y = X.to(device), Y.to(device)
+        encoded_X = self.encoder(X)
+        pred = self.forecaster(encoded_X)
 
-        encoded_X = encoder(X)
-        pred = forecaster(encoded_X)
+        Loss, RMSE_time, CEL_size = cost_function(Y, pred, self.time_weight, 1)
 
-        Loss, RMSE_time, CEL_size = cost_function(Y, pred, time_weight, 1)
-        loss_rollingmean = loss_rollingmean + (Loss - loss_rollingmean) / (1 + batch)
-        lossRMSE_rollingmean = lossRMSE_rollingmean + (
-            RMSE_time - lossRMSE_rollingmean
-        ) / (1 + batch)
-        lossCEL_rollingmean = lossCEL_rollingmean + (CEL_size - lossCEL_rollingmean) / (
-            1 + batch
-        )
+        self.optimizer.zero_grad(set_to_none=False)
+        Loss.backward()
+        self.optimizer.step()
 
-        if epochtype == "train":
-            optimizer.zero_grad()
-            Loss.backward()
-            optimizer.step()
+        self.last_loss = torch.stack((Loss, RMSE_time, CEL_size)).detach()
+        self.loss_sum += self.last_loss
+
+    def capture(self):
+        # 캡처 전 warmup step으로 바뀐 weight / Adam state는 캡처 후 초기 상태로 되돌림
+        # → 실제 학습은 초기화된 모델에서 시작 (학습 결과에 영향 없음)
+        params = [p for group in self.optimizer.param_groups for p in group["params"]]
+        init_params = [p.detach().clone() for p in params]
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.step()
+
+        with torch.no_grad():
+            for p, p0 in zip(params, init_params):
+                p.copy_(p0)
+                p.grad.zero_()
+            for state in self.optimizer.state.values():
+                for v in state.values():
+                    v.zero_()
+            self.loss_sum.zero_()
+
+    def run(self, batch_idx):
+        self.batch_idx.copy_(batch_idx)
+        if self.graph is None:
+            self.step()
+        else:
+            self.graph.replay()
+
+
+def model_epoch(train_step):
+    size = len(train_step.dataset)
+    batch_total = size // batch_size  # drop_last=True
+    perm = torch.randperm(size, device=device)  # shuffle=True
+    train_step.loss_sum.zero_()
+
+    for batch in range(batch_total):
+        train_step.run(perm[batch * batch_size : (batch + 1) * batch_size])
 
         if batch % 500 == 0:
             print("batch", batch, "/", batch_total)
-            loss = Loss
-            loss, current = loss.item(), batch * X.shape[0]
+            loss, RMSE_time, CEL_size = train_step.last_loss.tolist()
+            current = batch * batch_size
             print(
-                f"loss: {loss:>7f}, ln(1+loss): {np.log(1+loss):>7f} | CEloss_action: {CEL_size:>7f}, MSEloss: {RMSE_time} | batch: {batch} | sample: [{current:>5d}/{size:>5d}] | lr: {optimizer.param_groups[0]['lr']}"
+                f"loss: {loss:>7f}, ln(1+loss): {np.log(1+loss):>7f} | CEloss_action: {CEL_size:>7f}, MSEloss: {RMSE_time} | batch: {batch} | sample: [{current:>5d}/{size:>5d}] | lr: {train_step.optimizer.param_groups[0]['lr']}"
             )
+    # batch 평균 (기존 rolling mean과 동일한 값)
     (
         loss_rollingmean,
         lossRMSE_rollingmean,
         lossCEL_rollingmean,
-    ) = (
-        loss_rollingmean.detach().cpu().numpy().item(),
-        lossRMSE_rollingmean.detach().cpu().numpy().item(),
-        lossCEL_rollingmean.detach().cpu().numpy().item(),
-    )
+    ) = (train_step.loss_sum / batch_total).tolist()
 
     print("epoch ended")
     print(
@@ -307,7 +304,7 @@ def model_epoch(
 
 def model_train(
     epochs,
-    train_loader,
+    train_dataset,
     time_weight,
 ):
     torch.cuda.empty_cache()
@@ -325,6 +322,7 @@ def model_train(
         list(encoder.parameters()) + list(forecaster.parameters()),
         lr=0.001,
         eps=1e-16,
+        capturable=str(device).startswith("cuda"),  # CUDA Graph 캡처용
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -348,22 +346,17 @@ def model_train(
     epoch_train_loss = []
     epoch_train_acc = []
 
+    train_step = TrainStep(train_dataset, encoder, forecaster, optimizer, time_weight)
+
     for epoch in range(epochs):
         torch.cuda.empty_cache()
         import gc
 
         gc.collect()
         print(f"Epoch {epoch}\n-------------------------------")
-        train_loss = model_epoch(
-            train_loader,
-            train_loader,
-            encoder,
-            forecaster,
-            optimizer,
-            scheduler,
-            "train",
-            time_weight,
-        )
+        epoch_start = datetime.now()
+        train_loss = model_epoch(train_step)
+        print(f"Epoch time: {(datetime.now() - epoch_start).total_seconds():.1f}s")
 
         epochloss = pd.DataFrame(
             np.concatenate((np.array([epoch]), np.asarray(train_loss)))
@@ -422,7 +415,7 @@ if __name__ == "__main__":
         Alpha_encoder,
     ) = model_train(
         epochs,
-        Alpha_train_loader,
+        Alpha_train_dataset,
         Alpha_time_weight,
     )
 
@@ -432,7 +425,7 @@ if __name__ == "__main__":
         HTTP_trainable_params_num,
         HTTP_model_parameter,
         HTTP_encoder,
-    ) = model_train(epochs, HTTP_train_loader, HTTP_time_weight)
+    ) = model_train(epochs, HTTP_train_dataset, HTTP_time_weight)
 
     (
         Multi_train_loss,
@@ -442,7 +435,7 @@ if __name__ == "__main__":
         Multi_encoder,
     ) = model_train(
         epochs,
-        Multi_train_loader,
+        Multi_train_dataset,
         Multi_time_weight,
     )
 
@@ -454,7 +447,7 @@ if __name__ == "__main__":
         Unlabeled_encoder,
     ) = model_train(
         epochs,
-        Unlabeled_train_loader,
+        Unlabeled_train_dataset,
         Unlabeled_time_weight,
     )
 

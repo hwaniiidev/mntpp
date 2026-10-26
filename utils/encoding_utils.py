@@ -2,7 +2,19 @@ import torch
 import numpy as np
 
 
+_positional_encoding_cache = {}
+
+
 def positional_encoding(src):
+    # 값이 src의 shape/dtype/device에만 의존하므로 한 번 계산 후 재사용
+    # (원소 단위 GPU 대입을 매 forward마다 반복하지 않도록)
+    key = (tuple(src.shape), src.dtype, src.device)
+    if key not in _positional_encoding_cache:
+        _positional_encoding_cache[key] = _compute_positional_encoding(src)
+    return _positional_encoding_cache[key]
+
+
+def _compute_positional_encoding(src):
     pos_encoding = torch.zeros_like(src)
     seq_len = pos_encoding.shape[0]
     d_model = pos_encoding.shape[1]
