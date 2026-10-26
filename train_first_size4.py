@@ -82,24 +82,16 @@ def split_by_label(df):
 
 
 def concat_pktTime_pktSize(df):
-    concat_time = []
-    concat_size = []
-    seq_id = []
-
-    for i in range(len(df)):
-        valid_len = min(int(df["len"].iloc[i]), max_len)
-        pkt_time_values = df[valid_pkt_time_columns].iloc[i, :valid_len].values
-        pkt_size_values = df[valid_pkt_size_columns].iloc[i, :valid_len].values
-
-        concat_time.extend(pkt_time_values)
-        concat_size.extend(pkt_size_values)
-        seq_id.extend([i] * valid_len)
+    # Vectorized: flattens the first min(len, max_len) packets of every row, row by row
+    # (same output as the previous per-row loop)
+    valid_len = np.minimum(df["len"].to_numpy().astype(int), max_len)
+    packet_mask = np.arange(max_len)[None, :] < valid_len[:, None]
 
     result_df = pd.DataFrame(
         {
-            "seqId": seq_id,
-            "pktTime": concat_time,
-            "pktSize": concat_size,
+            "seqId": np.repeat(np.arange(len(df)), valid_len),
+            "pktTime": df[valid_pkt_time_columns].to_numpy()[packet_mask],
+            "pktSize": df[valid_pkt_size_columns].to_numpy()[packet_mask],
         }
     )
 
@@ -116,11 +108,15 @@ target_vars = ["pktTime", "pktSize"]
 
 
 def valid_slice_flag(df, window_size):
-    df["valid_slice_flag"] = True
-    for i in range(len(df) - 1):
-        if df.seqId[i] != df.seqId[i + 1]:
-            df.loc[i + 1 - window_size : i, ["valid_slice_flag"]] = False
-    df.loc[len(df) - window_size : len(df), ["valid_slice_flag"]] = False
+    # Vectorized: marks the last window_size rows before every sequence end as invalid
+    # (same output as the previous per-row loop)
+    seq_end = np.flatnonzero(df["seqId"].to_numpy()[:-1] != df["seqId"].to_numpy()[1:])
+    seq_end = np.append(seq_end, len(df) - 1)
+
+    invalid_count = np.zeros(len(df) + 1, dtype=int)
+    np.add.at(invalid_count, np.maximum(seq_end - window_size + 1, 0), 1)
+    np.add.at(invalid_count, seq_end + 1, -1)
+    df["valid_slice_flag"] = np.cumsum(invalid_count[:-1]) == 0
     return df
 
 

@@ -24,6 +24,7 @@ _parser.add_argument("--n_streams", type=int, default=10000)      # train 클래
 _parser.add_argument("--num_valid", type=int, default=None)       # None이면 config_label.yaml 값 사용
 _parser.add_argument("--num_test", type=int, default=None)        # None이면 config_label.yaml 값 사용
 _parser.add_argument("--max_len", type=int, default=9)
+_parser.add_argument("--epochs", type=int, default=1000)
 _parser.add_argument("--scheduler", type=str, default="none",
                      choices=["none", "reduce", "cosine", "cosine_wr", "multistep", "exponential", "onecycle"])
 _parser.add_argument("--mlp_type", type=str, default="grouped",
@@ -47,7 +48,7 @@ from models.MLP import GroupedMLP1, ResGroupedMLP1, DenseGroupedMLP, SEGroupedML
 from sklearn.metrics import classification_report
 
 max_len = _args.max_len
-epochs = 1000
+epochs = _args.epochs
 window_size = _args.window_size
 batch_size, num_workers = (max_len - window_size) * 10, 0  # batch 조정
 
@@ -75,29 +76,17 @@ train, valid, test = data_utils.define_data(csv_path, max_len, n_streams, label_
 
 
 def concat_pktTime_pktSize(df):
-    concat_time = []
-    concat_size = []
-    seq_id = []
-    label = []
-
-    label_values = df["taxonomy label"].values
-
-    for i in range(len(df)):
-        valid_len = min(int(df["len"].iloc[i]), max_len)
-        pkt_time_values = df[valid_pkt_time_columns].iloc[i, :valid_len].values
-        pkt_size_values = df[valid_pkt_size_columns].iloc[i, :valid_len].values
-
-        concat_time.extend(pkt_time_values)
-        concat_size.extend(pkt_size_values)
-        seq_id.extend([i] * valid_len)
-        label.extend([label_values[i]] * valid_len)
+    # Vectorized: flattens the first min(len, max_len) packets of every row, row by row
+    # (same output as the previous per-row loop)
+    valid_len = np.minimum(df["len"].to_numpy().astype(int), max_len)
+    packet_mask = np.arange(max_len)[None, :] < valid_len[:, None]
 
     result_df = pd.DataFrame(
         {
-            "seqId": seq_id,
-            "pktTime": concat_time,
-            "pktSize": concat_size,
-            "label": label,
+            "seqId": np.repeat(np.arange(len(df)), valid_len),
+            "pktTime": df[valid_pkt_time_columns].to_numpy()[packet_mask],
+            "pktSize": df[valid_pkt_size_columns].to_numpy()[packet_mask],
+            "label": np.repeat(df["taxonomy label"].to_numpy(), valid_len),
         }
     )
 
@@ -112,11 +101,15 @@ target_vars = ["label"]
 
 
 def valid_slice_flag(df, window_size):
-    df["valid_slice_flag"] = True
-    for i in range(len(df) - 1):
-        if df.seqId[i] != df.seqId[i + 1]:
-            df.loc[i + 1 - window_size : i, ["valid_slice_flag"]] = False
-    df.loc[len(df) - window_size : len(df), ["valid_slice_flag"]] = False
+    # Vectorized: marks the last window_size rows before every sequence end as invalid
+    # (same output as the previous per-row loop)
+    seq_end = np.flatnonzero(df["seqId"].to_numpy()[:-1] != df["seqId"].to_numpy()[1:])
+    seq_end = np.append(seq_end, len(df) - 1)
+
+    invalid_count = np.zeros(len(df) + 1, dtype=int)
+    np.add.at(invalid_count, np.maximum(seq_end - window_size + 1, 0), 1)
+    np.add.at(invalid_count, seq_end + 1, -1)
+    df["valid_slice_flag"] = np.cumsum(invalid_count[:-1]) == 0
     return df
 
 
@@ -144,6 +137,14 @@ encode_train = encode(train_sequences)
 encode_valid = encode(valid_sequences)
 encode_test = encode(test_sequences)
 
+# label / seqId as arrays, so __getitem__ doesn't build a pandas row per sample
+label_train = torch.from_numpy(train_sequences[target_vars].to_numpy(dtype="int"))
+label_valid = torch.from_numpy(valid_sequences[target_vars].to_numpy(dtype="int"))
+label_test = torch.from_numpy(test_sequences[target_vars].to_numpy(dtype="int"))
+seq_id_train = train_sequences["seqId"].to_numpy()
+seq_id_valid = valid_sequences["seqId"].to_numpy()
+seq_id_test = test_sequences["seqId"].to_numpy()
+
 # print(encode_test)
 # print(len(encode_test)) # 4000
 
@@ -169,10 +170,8 @@ class train_data:
     def __getitem__(self, i):
         j = self.valid_slice_idxn[i]
         x = encode_train[j : j + window_size]
-        row = train_sequences.iloc[j + window_size]
-        y = row.loc[target_vars]
-        seq_id = row["seqId"]
-        y = torch.from_numpy(y.to_numpy(dtype="int"))
+        y = label_train[j + window_size]
+        seq_id = seq_id_train[j + window_size]
         return x, y, seq_id
 
 
@@ -189,10 +188,8 @@ class valid_data:
     def __getitem__(self, i):
         j = self.valid_slice_idxn[i]
         x = encode_valid[j : j + window_size]
-        row = valid_sequences.iloc[j + window_size]
-        y = row.loc[target_vars]
-        seq_id = row["seqId"]
-        y = torch.from_numpy(y.to_numpy(dtype="int"))
+        y = label_valid[j + window_size]
+        seq_id = seq_id_valid[j + window_size]
         return x, y, seq_id
 
 
@@ -209,10 +206,8 @@ class test_data:
     def __getitem__(self, i):
         j = self.test_slice_idxn[i]
         x = encode_test[j : j + window_size]
-        row = test_sequences.iloc[j + window_size]
-        y = row.loc[target_vars]
-        seq_id = row["seqId"]
-        y = torch.from_numpy(y.to_numpy(dtype="int"))
+        y = label_test[j + window_size]
+        seq_id = seq_id_test[j + window_size]
         return x, y, seq_id
 
 
@@ -296,43 +291,65 @@ test_loader = DataLoader(
 # test_loader :  40 (drop_last=True / False)
 
 
+def load_batches(data_loader):
+    # Read a loader once and keep its batches on the device
+    # (the loaders don't shuffle, so every epoch sees exactly these batches)
+    batches = []
+    for inputs, labels, lengths in data_loader:
+        batches.append((inputs.to(device), labels.to(device).squeeze(1)))
+    return batches
+
+
+def run_encoders(
+    batches, Alpha_model, HTTP_model, Multi_model, Normal_model, grad_enabled
+):
+    # The Stage 1 encoders are frozen (eval mode) and the batches are fixed,
+    # so their outputs are the same every epoch: compute them once and reuse them.
+    # grad_enabled mirrors the autograd mode of the previous per-epoch loop
+    # (it can change which TransformerEncoderLayer kernel path runs), keeping outputs bit-identical
+    encoded_batches = []
+    with torch.set_grad_enabled(grad_enabled):
+        for inputs, labels in batches:
+            B, S, W, F = inputs.shape
+            inputs_3d = inputs.view(B * S, W, F)
+            window_lengths = torch.full((B * S,), W, dtype=torch.long, device=device)
+
+            Alpha_pred = Alpha_model(inputs_3d, window_lengths).view(B, S, -1).detach()
+            HTTP_pred = HTTP_model(inputs_3d, window_lengths).view(B, S, -1).detach()
+            Multi_pred = Multi_model(inputs_3d, window_lengths).view(B, S, -1).detach()
+            Normal_pred = Normal_model(inputs_3d, window_lengths).view(B, S, -1).detach()
+
+            encoded_batches.append(
+                ((Alpha_pred, HTTP_pred, Multi_pred, Normal_pred), labels)
+            )
+    return encoded_batches
+
+
+def sum_losses(losses):
+    # One device sync per epoch; same summation order / values as the previous per-batch loss.item()
+    total_loss = 0.0
+    for batch_loss in torch.stack(losses).tolist():
+        total_loss += batch_loss
+    return total_loss
+
+
+def to_list(tensors):
+    return list(torch.cat(tensors).cpu().numpy())
+
+
 def train_model(
     mlp,
-    train_loader,
-    Alpha_model,
-    HTTP_model,
-    Multi_model,
-    Normal_model,
+    encoded_batches,
     criterion,
     optimizer,
 ):
     mlp.train()
 
-    total_loss = 0.0
+    losses = []
     all_preds, all_labels = [], []
 
-    for inputs, labels, lengths in train_loader:
+    for (Alpha_pred, HTTP_pred, Multi_pred, Normal_pred), labels in encoded_batches:
         optimizer.zero_grad()
-        inputs, labels, lengths = (
-            inputs.to(device),
-            labels.to(device).squeeze(1),
-            lengths.to(device),
-        )
-
-        # if first_print:
-        #     print("inputs : ", inputs)
-        #     print("labels : ", labels)
-        #     first_print = False
-        #     break
-
-        B, S, W, F = inputs.shape
-        inputs_3d = inputs.view(B * S, W, F)
-        window_lengths = torch.full((B * S,), W, dtype=torch.long, device=device)
-
-        Alpha_pred = Alpha_model(inputs_3d, window_lengths).view(B, S, -1)
-        HTTP_pred = HTTP_model(inputs_3d, window_lengths).view(B, S, -1)
-        Multi_pred = Multi_model(inputs_3d, window_lengths).view(B, S, -1)
-        Normal_pred = Normal_model(inputs_3d, window_lengths).view(B, S, -1)
 
         predictions = mlp(
             Alpha_pred,
@@ -341,27 +358,20 @@ def train_model(
             Normal_pred,
         )
 
-        # print("predictions : ", predictions)
-        # print("labels : ", labels)
         loss = criterion(predictions, labels)
 
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        losses.append(loss.detach())
 
-        # probs = F.softmax(predictions, dim=1)
         _, predicted_classes = torch.max(predictions, 1)
 
-        # print("predicted_classes : ", predicted_classes)
-        # print("labels : ", grouped_labels)
+        all_preds.append(predicted_classes)
+        all_labels.append(labels)
 
-        all_preds.extend(predicted_classes.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        # print("all_preds :", all_preds)
-        # print("all_labels :", all_labels)
-
-    train_loss = total_loss / len(train_loader)
+    train_loss = sum_losses(losses) / len(encoded_batches)
+    all_preds, all_labels = to_list(all_preds), to_list(all_labels)
     train_accuracy = accuracy_score(all_labels, all_preds)
     train_f1 = f1_score(all_labels, all_preds, average="weighted")
 
@@ -370,35 +380,16 @@ def train_model(
 
 def evaluate_model(
     mlp,
-    data_loader,
-    Alpha_model,
-    HTTP_model,
-    Multi_model,
-    Normal_model,
+    encoded_batches,
     criterion,
 ):
     mlp.eval()
 
-    total_loss = 0.0
+    losses = []
     all_preds, all_labels = [], []
 
     with torch.no_grad():
-        for inputs, labels, lengths in data_loader:
-            inputs, labels, lengths = (
-                inputs.to(device),
-                labels.to(device).squeeze(1),
-                lengths.to(device),
-            )
-
-            B, S, W, F = inputs.shape
-            inputs_3d = inputs.view(B * S, W, F)
-            window_lengths = torch.full((B * S,), W, dtype=torch.long, device=device)
-
-            Alpha_pred = Alpha_model(inputs_3d, window_lengths).view(B, S, -1)
-            HTTP_pred = HTTP_model(inputs_3d, window_lengths).view(B, S, -1)
-            Multi_pred = Multi_model(inputs_3d, window_lengths).view(B, S, -1)
-            Normal_pred = Normal_model(inputs_3d, window_lengths).view(B, S, -1)
-
+        for (Alpha_pred, HTTP_pred, Multi_pred, Normal_pred), labels in encoded_batches:
             predictions = mlp(
                 Alpha_pred,
                 HTTP_pred,
@@ -408,44 +399,29 @@ def evaluate_model(
 
             loss = criterion(predictions, labels)
 
-            total_loss += loss.item()
+            losses.append(loss)
 
             _, predicted_classes = torch.max(predictions, 1)
 
-            all_preds.extend(predicted_classes.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_preds.append(predicted_classes)
+            all_labels.append(labels)
 
-        loss = total_loss / len(data_loader)
+        loss = sum_losses(losses) / len(encoded_batches)
+        all_preds, all_labels = to_list(all_preds), to_list(all_labels)
         accuracy = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, average="weighted")
 
     return loss, accuracy, f1
 
 
-def predict_model(mlp, data_loader, Alpha_model, HTTP_model, Multi_model, Normal_model, return_proba=False):
+def predict_model(mlp, encoded_batches, return_proba=False):
     mlp.eval()
 
     all_preds, all_labels = [], []
     all_probs = []  # AUC용 클래스별 확률
 
-    # first_print = True
-
     with torch.no_grad():
-        for inputs, labels, lengths in data_loader:
-            inputs, labels, lengths = (
-                inputs.to(device),
-                labels.to(device).squeeze(1),
-                lengths.to(device),
-            )
-            B, S, W, F = inputs.shape
-            inputs_3d = inputs.view(B * S, W, F)
-            window_lengths = torch.full((B * S,), W, dtype=torch.long, device=device)
-
-            Alpha_pred = Alpha_model(inputs_3d, window_lengths).view(B, S, -1)
-            HTTP_pred = HTTP_model(inputs_3d, window_lengths).view(B, S, -1)
-            Multi_pred = Multi_model(inputs_3d, window_lengths).view(B, S, -1)
-            Normal_pred = Normal_model(inputs_3d, window_lengths).view(B, S, -1)
-
+        for (Alpha_pred, HTTP_pred, Multi_pred, Normal_pred), labels in encoded_batches:
             predictions = mlp(
                 Alpha_pred,
                 HTTP_pred,
@@ -453,21 +429,15 @@ def predict_model(mlp, data_loader, Alpha_model, HTTP_model, Multi_model, Normal
                 Normal_pred,
             )
 
-            # probs = F.softmax(predictions, dim=1)
             _, predicted_classes = torch.max(predictions, 1)
-            all_probs.append(torch.softmax(predictions, dim=1).cpu().numpy())  # AUC용
+            all_probs.append(torch.softmax(predictions, dim=1))  # AUC용
 
-            all_preds.extend(predicted_classes.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_preds.append(predicted_classes)
+            all_labels.append(labels)
 
-        # y_pred_list = [a.flatten().tolist() for a in all_preds]
-        # y_list = [a.flatten().tolist() for a in all_labels]
-
-        # y_pred_list = list(itertools.chain(*y_pred_list))
-        # y_list = list(itertools.chain(*y_list))
-
+    all_preds, all_labels = to_list(all_preds), to_list(all_labels)
     if return_proba:
-        return all_labels, all_preds, np.concatenate(all_probs)
+        return all_labels, all_preds, torch.cat(all_probs).cpu().numpy()
     return all_labels, all_preds
 
 
@@ -495,6 +465,13 @@ def train_and_evaluate_model(epochs, train_loader, valid_loader, test_loader):
     HTTP_model.eval()
     Multi_model.eval()
     Normal_model.eval()
+
+    train_batches = load_batches(train_loader)
+    valid_batches = load_batches(valid_loader)
+    test_batches = load_batches(test_loader)
+    encoder_models = (Alpha_model, HTTP_model, Multi_model, Normal_model)
+    train_encoded = run_encoders(train_batches, *encoder_models, grad_enabled=True)  # as in train_model
+    valid_encoded = run_encoders(valid_batches, *encoder_models, grad_enabled=False)  # as in evaluate_model
 
     group_size = max_len - window_size  ####
     feature_dim = 5
@@ -550,21 +527,13 @@ def train_and_evaluate_model(epochs, train_loader, valid_loader, test_loader):
     for epoch in range(epochs):
         train_loss, train_accuracy, train_f1 = train_model(
             mlp,
-            train_loader,
-            Alpha_model,
-            HTTP_model,
-            Multi_model,
-            Normal_model,
+            train_encoded,
             criterion,
             optimizer,
         )
         valid_loss, valid_accuracy, valid_f1 = evaluate_model(
             mlp,
-            valid_loader,
-            Alpha_model,
-            HTTP_model,
-            Multi_model,
-            Normal_model,
+            valid_encoded,
             criterion,
         )
 
@@ -638,29 +607,17 @@ def train_and_evaluate_model(epochs, train_loader, valid_loader, test_loader):
 
     y_train_list, y_train_pred_list, y_train_prob = predict_model(
         mlp,
-        train_loader,
-        Alpha_model,
-        HTTP_model,
-        Multi_model,
-        Normal_model,
+        run_encoders(train_batches, *encoder_models, grad_enabled=False),  # as in predict_model
         return_proba=True,  # AUC 계산용 확률도 받음
     )
     y_valid_list, y_valid_pred_list, y_valid_prob = predict_model(
         mlp,
-        valid_loader,
-        Alpha_model,
-        HTTP_model,
-        Multi_model,
-        Normal_model,
+        run_encoders(valid_batches, *encoder_models, grad_enabled=False),  # as in predict_model
         return_proba=True,  # AUC 계산용 확률도 받음
     )
     y_test_list, y_test_pred_list, y_test_prob = predict_model(
         mlp,
-        test_loader,
-        Alpha_model,
-        HTTP_model,
-        Multi_model,
-        Normal_model,
+        run_encoders(test_batches, *encoder_models, grad_enabled=False),  # as in predict_model
         return_proba=True,  # AUC 계산용 확률도 받음
     )
 
